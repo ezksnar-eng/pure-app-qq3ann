@@ -1,7 +1,6 @@
 .gradle/
-.idea/
+build/
 local.properties
-**/build/
-app/google-services.json
+.idea/
 *.iml
-.DS_Store
+.cxx/

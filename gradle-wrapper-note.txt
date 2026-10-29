@@ -1,2 +1,0 @@
-Gradle wrapper distribution is configured in gradle/wrapper/gradle-wrapper.properties for Gradle 8.9.
-This source bundle does not include gradlew scripts or gradle-wrapper.jar. Generate them by running `gradle wrapper` in an environment with Gradle installed, or open the project in Android Studio and sync it. A GitHub Actions workflow is included to build with Gradle 8.9 in the cloud.
