@@ -1,0 +1,1 @@
+Gradle wrapper binaries are not bundled in this starter. Open in Android Studio and use its Gradle integration, or run `gradle wrapper` with Gradle installed to generate wrapper files.
