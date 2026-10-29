@@ -11,6 +11,16 @@ service cloud.firestore {
       match /favorites/{mangaId} { allow read, write: if isOwner(uid); }
       match /readingProgress/{mangaId} { allow read, write: if isOwner(uid); }
     }
+    match /mangaSubmissions/{submissionId} {
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.status == 'pending_review'
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 120;
+      allow read: if isAdmin() || (signedIn() && resource.data.createdBy == request.auth.uid);
+      allow update, delete: if isAdmin();
+    }
     match /manga/{mangaId} {
       allow read: if resource.data.status == 'published' || isAdmin();
       allow create, update, delete: if isAdmin();

@@ -22,7 +22,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,12 +62,49 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MangaVerseApp() {
+    val context = LocalContext.current
+    val preferences = remember(context) { context.getSharedPreferences("mangaverse_local", android.content.Context.MODE_PRIVATE) }
+    var catalog by remember { mutableStateOf(demoManga) }
+    var catalogMessage by remember { mutableStateOf("") }
+    DisposableEffect(Unit) {
+        var registration: com.google.firebase.firestore.ListenerRegistration? = null
+        try {
+            registration = FirebaseFirestore.getInstance().collection("manga")
+                .whereEqualTo("status", "published")
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) { catalogMessage = "تعذّر تحديث المكتبة؛ نعرض المحتوى المحلي."; return@addSnapshotListener }
+                    val remote = snapshot?.documents.orEmpty().mapNotNull { doc ->
+                        val title = doc.getString("title")?.trim().orEmpty()
+                        if (title.isBlank()) return@mapNotNull null
+                        Manga(
+                            id = doc.id,
+                            title = title,
+                            genre = doc.getString("genre") ?: "غير مصنّف",
+                            rating = doc.getDouble("rating")?.toString() ?: "—",
+                            chapters = (doc.getLong("chapterCount") ?: doc.getLong("chapters") ?: 1L).toInt().coerceAtLeast(1),
+                            color = Color(0xFFE9E5FF),
+                            emoji = "📚",
+                            description = doc.getString("description") ?: "لا يوجد وصف متاح حالياً."
+                        )
+                    }
+                    if (remote.isNotEmpty()) { catalog = remote; catalogMessage = "" }
+                    else catalogMessage = "ماكو مانجا منشورة بقاعدة البيانات بعد؛ نعرض أمثلة محلية."
+                }
+        } catch (_: IllegalStateException) {
+            catalogMessage = "Firebase غير مهيأ؛ نعرض أمثلة محلية."
+        }
+        onDispose { registration?.remove() }
+    }
     var tab by remember { mutableStateOf("الرئيسية") }
     var selected by remember { mutableStateOf<Manga?>(null) }
     var reader by remember { mutableStateOf(false) }
     var search by remember { mutableStateOf("") }
-    var favorites by remember { mutableStateOf(setOf<String>()) }
-    var userEmail by remember { mutableStateOf(FirebaseAuth.getInstance().currentUser?.email.orEmpty()) }
+    var favorites by remember {
+        mutableStateOf(preferences.getStringSet("favorite_ids", emptySet())?.toSet() ?: emptySet())
+    }
+    var userEmail by remember { mutableStateOf(currentFirebaseUserEmail()) }
+    var lastReadMangaId by remember { mutableStateOf(preferences.getString("last_read_manga_id", "").orEmpty()) }
+    var lastReadChapter by remember { mutableIntStateOf(preferences.getInt("last_read_chapter", 1)) }
     var showAuth by remember { mutableStateOf(false) }
     var admin by remember { mutableStateOf(false) }
 
@@ -70,14 +112,31 @@ fun MangaVerseApp() {
         Surface(Modifier.fillMaxSize(), color = Paper) {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 when {
-                    reader && selected != null -> ReaderScreen(selected!!, onBack = { reader = false })
+                    reader && selected != null -> ReaderScreen(
+                        manga = selected!!,
+                        initialChapter = preferences.getInt("last_read_chapter_${selected!!.id}", 1),
+                        onBack = { reader = false },
+                        onProgress = { chapter ->
+                            preferences.edit()
+                                .putString("last_read_manga_id", selected!!.id)
+                                .putInt("last_read_chapter", chapter)
+                                .apply()
+                            lastReadMangaId = selected!!.id
+                            lastReadChapter = chapter
+                            syncReadingProgress(selected!!.id, chapter)
+                        }
+                    )
                     selected != null -> DetailScreen(
                         manga = selected!!,
                         favorite = favorites.contains(selected!!.id),
                         onBack = { selected = null },
-                        onRead = { reader = true },
+                        onRead = { chapter ->
+                            preferences.edit().putInt("last_read_chapter_${selected!!.id}", chapter).apply()
+                            reader = true
+                        },
                         onFavorite = {
                             favorites = if (favorites.contains(selected!!.id)) favorites - selected!!.id else favorites + selected!!.id
+                            preferences.edit().putStringSet("favorite_ids", favorites.toSet()).apply()
                             syncFavorite(selected!!.id, favorites.contains(selected!!.id))
                         }
                     )
@@ -105,17 +164,33 @@ fun MangaVerseApp() {
                     ) { padding ->
                         Column(Modifier.fillMaxSize().padding(padding)) {
                             Header(userEmail)
+                            if (catalogMessage.isNotBlank()) Text(catalogMessage, color = Muted, fontSize = 11.sp, modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp))
                             when (tab) {
                                 "الرئيسية" -> HomeScreen(
-                                    search = search, onSearch = { search = it },
+                                    catalog = catalog, search = search, onSearch = { search = it },
                                     onOpen = { selected = it },
-                                    onExplore = { tab = "استكشاف" }
+                                    onExplore = { tab = "استكشاف" },
+                                    lastReadManga = catalog.firstOrNull { it.id == lastReadMangaId },
+                                    lastReadChapter = lastReadChapter,
+                                    onContinue = { manga, chapter ->
+                                        selected = manga
+                                        preferences.edit().putInt("last_read_chapter_${manga.id}", chapter).apply()
+                                        reader = true
+                                    }
                                 )
-                                "استكشاف" -> ExploreScreen(search, { search = it }, { selected = it })
-                                "مكتبتي" -> LibraryScreen(demoManga.filter { favorites.contains(it.id) }, { selected = it })
+                                "استكشاف" -> ExploreScreen(catalog, search, { search = it }, { selected = it })
+                                "مكتبتي" -> LibraryScreen(catalog.filter { favorites.contains(it.id) }, { selected = it })
                                 else -> AccountScreen(
                                     email = userEmail,
                                     onAuth = { showAuth = true },
+                                    onSignOut = {
+                                        try {
+                                            FirebaseAuth.getInstance().signOut()
+                                            userEmail = ""
+                                        } catch (_: IllegalStateException) {
+                                            userEmail = ""
+                                        }
+                                    },
                                     onAdmin = { admin = !admin },
                                     admin = admin
                                 )
@@ -149,7 +224,15 @@ private fun Header(email: String) {
 }
 
 @Composable
-private fun HomeScreen(search: String, onSearch: (String) -> Unit, onOpen: (Manga) -> Unit, onExplore: () -> Unit) {
+private fun HomeScreen(
+    catalog: List<Manga>, search: String, onSearch: (String) -> Unit,
+    onOpen: (Manga) -> Unit, onExplore: () -> Unit,
+    lastReadManga: Manga?, lastReadChapter: Int,
+    onContinue: (Manga, Int) -> Unit
+) {
+    val visibleCatalog = catalog.filter {
+        search.isBlank() || it.title.contains(search, true) || it.genre.contains(search, true) || it.description.contains(search, true)
+    }
     LazyColumn(contentPadding = PaddingValues(bottom = 20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
         item {
             OutlinedTextField(
@@ -159,14 +242,31 @@ private fun HomeScreen(search: String, onSearch: (String) -> Unit, onOpen: (Mang
                 shape = RoundedCornerShape(16.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color(0xFFE5E4EF), focusedBorderColor = Violet)
             )
         }
+        if (lastReadManga != null) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp).clip(RoundedCornerShape(18.dp))
+                        .background(Color(0xFFECE9FF)).clickable { onContinue(lastReadManga, lastReadChapter) }.padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Cover(lastReadManga, Modifier.size(62.dp, 76.dp))
+                    Column(Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text("كمّل قراءتك", color = Violet, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text(lastReadManga.title, color = Ink, fontWeight = FontWeight.ExtraBold)
+                        Text("الفصل $lastReadChapter", color = Muted, fontSize = 12.sp)
+                    }
+                    Icon(Icons.Default.PlayArrow, contentDescription = "متابعة القراءة", tint = Violet)
+                }
+            }
+        }
         item {
             Column(Modifier.padding(horizontal = 16.dp)) {
-                Box(Modifier.fillMaxWidth().height(174.dp).clip(RoundedCornerShape(24.dp)).background(Color(0xFF24234E)).clickable { onOpen(demoManga[0]) }.padding(20.dp)) {
+                Box(Modifier.fillMaxWidth().height(174.dp).clip(RoundedCornerShape(24.dp)).background(Color(0xFF24234E)).clickable { onOpen(catalog.firstOrNull() ?: demoManga[0]) }.padding(20.dp)) {
                     Column(Modifier.align(Alignment.CenterStart), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("اختيار الأسبوع", color = Color(0xFFC9C2FF), fontSize = 12.sp)
                         Text("Solo Leveling", color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.Black)
                         Text("ابدأ المغامرة الآن", color = Color.White.copy(alpha = .85f), fontSize = 13.sp)
-                        Surface(color = Violet, shape = RoundedCornerShape(10.dp), modifier = Modifier.clickable { onOpen(demoManga[0]) }) {
+                        Surface(color = Violet, shape = RoundedCornerShape(10.dp), modifier = Modifier.clickable { onOpen(catalog.firstOrNull() ?: demoManga[0]) }) {
                             Text("اقرأ الآن  ←", color = Color.White, modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp), fontWeight = FontWeight.Bold)
                         }
                     }
@@ -177,11 +277,11 @@ private fun HomeScreen(search: String, onSearch: (String) -> Unit, onOpen: (Mang
         item { SectionTitle("الأكثر قراءة", "عرض الكل", onExplore) }
         item {
             LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(demoManga) { manga -> MangaPoster(manga, onClick = { onOpen(manga) }) }
+                items(visibleCatalog) { manga -> MangaPoster(manga, onClick = { onOpen(manga) }) }
             }
         }
         item { SectionTitle("أحدث الفصول", "كل الفصول", onExplore) }
-        items(demoManga.take(4)) { manga ->
+        items(visibleCatalog.take(4)) { manga ->
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).clip(RoundedCornerShape(16.dp)).background(Color.White).clickable { onOpen(manga) }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Cover(manga, Modifier.size(66.dp, 78.dp))
                 Column(Modifier.weight(1f).padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -228,8 +328,8 @@ private fun MangaPoster(manga: Manga, onClick: () -> Unit) {
 }
 
 @Composable
-private fun ExploreScreen(search: String, onSearch: (String) -> Unit, onOpen: (Manga) -> Unit) {
-    val filtered = demoManga.filter { it.title.contains(search, true) || it.genre.contains(search, true) }
+private fun ExploreScreen(catalog: List<Manga>, search: String, onSearch: (String) -> Unit, onOpen: (Manga) -> Unit) {
+    val filtered = catalog.filter { it.title.contains(search, true) || it.genre.contains(search, true) }
     Column(Modifier.fillMaxSize()) {
         Text("استكشاف المانجا", fontSize = 24.sp, color = Ink, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(20.dp))
         OutlinedTextField(search, onSearch, Modifier.fillMaxWidth().padding(horizontal = 16.dp), placeholder = { Text("اسم المانجا أو التصنيف") }, leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true, shape = RoundedCornerShape(14.dp))
@@ -250,7 +350,7 @@ private fun ExploreScreen(search: String, onSearch: (String) -> Unit, onOpen: (M
 }
 
 @Composable
-private fun DetailScreen(manga: Manga, favorite: Boolean, onBack: () -> Unit, onRead: () -> Unit, onFavorite: () -> Unit) {
+private fun DetailScreen(manga: Manga, favorite: Boolean, onBack: () -> Unit, onRead: (Int) -> Unit, onFavorite: () -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowForward, "رجوع") }
@@ -265,14 +365,14 @@ private fun DetailScreen(manga: Manga, favorite: Boolean, onBack: () -> Unit, on
                 Text("الحالة: مستمرة", color = Muted, fontSize = 12.sp)
             }
         }
-        Button(onClick = onRead, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp).height(52.dp), shape = RoundedCornerShape(15.dp)) {
+        Button(onClick = { onRead(1) }, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp).height(52.dp), shape = RoundedCornerShape(15.dp)) {
             Icon(Icons.Default.MenuBook, null); Spacer(Modifier.width(8.dp)); Text("ابدأ القراءة")
         }
         Text("القصة", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
         Text(manga.description, color = Muted, lineHeight = 25.sp, modifier = Modifier.padding(horizontal = 20.dp))
         Text("الفصول", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(20.dp))
         (1..minOf(12, manga.chapters)).reversed().forEach { chapter ->
-            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(12.dp)).background(Color.White).clickable { onRead() }.padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).clip(RoundedCornerShape(12.dp)).background(Color.White).clickable { onRead(chapter) }.padding(16.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text("الفصل $chapter", color = Ink, fontWeight = FontWeight.SemiBold)
                 Icon(Icons.Default.ChevronLeft, null, tint = Violet)
             }
@@ -281,9 +381,47 @@ private fun DetailScreen(manga: Manga, favorite: Boolean, onBack: () -> Unit, on
 }
 
 @Composable
-private fun ReaderScreen(manga: Manga, onBack: () -> Unit) {
-    var chapter by remember { mutableIntStateOf(1) }
+private fun ReaderScreen(manga: Manga, initialChapter: Int, onBack: () -> Unit, onProgress: (Int) -> Unit) {
+    val context = LocalContext.current
+    val preferences = remember(context) {
+        context.getSharedPreferences("mangaverse_local", android.content.Context.MODE_PRIVATE)
+    }
+    var chapter by remember(manga.id) {
+        mutableIntStateOf(
+            initialChapter.coerceIn(1, manga.chapters.coerceAtLeast(1))
+        )
+    }
     var showControls by remember { mutableStateOf(true) }
+    var pageUrls by remember(manga.id, chapter) { mutableStateOf<List<String>>(emptyList()) }
+    var pageLoadMessage by remember(manga.id, chapter) { mutableStateOf("جاري البحث عن صفحات الفصل…") }
+    LaunchedEffect(manga.id, chapter) {
+        pageUrls = emptyList()
+        pageLoadMessage = "جاري البحث عن صفحات الفصل…"
+        try {
+            FirebaseFirestore.getInstance()
+                .collection("manga").document(manga.id)
+                .collection("chapters").document(chapter.toString())
+                .get()
+                .addOnSuccessListener { document ->
+                    val urls = (document.get("pageUrls") as? List<*>)
+                        ?: (document.get("pages") as? List<*>)
+                        ?: emptyList<Any>()
+                    pageUrls = urls.filterIsInstance<String>().filter { it.startsWith("https://") }
+                    pageLoadMessage = if (pageUrls.isEmpty()) "ماكو صفحات منشورة لهذا الفصل بعد." else ""
+                }
+                .addOnFailureListener { pageLoadMessage = "تعذّر تحميل الصفحات. تحقق من اتصال الإنترنت وإعداد Firebase." }
+        } catch (_: IllegalStateException) {
+            pageLoadMessage = "قارئ تجريبي: اربط Firebase وأضف صفحات مرخّصة لهذا الفصل."
+        }
+    }
+    LaunchedEffect(manga.id, chapter) {
+        preferences.edit()
+            .putInt("last_read_chapter_${manga.id}", chapter)
+            .putString("last_read_manga_id", manga.id)
+            .putInt("last_read_chapter", chapter)
+            .apply()
+        onProgress(chapter)
+    }
     Column(Modifier.fillMaxSize().background(Color(0xFF111118))) {
         if (showControls) {
             Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -296,12 +434,20 @@ private fun ReaderScreen(manga: Manga, onBack: () -> Unit) {
             }
         }
         Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).clickable { showControls = !showControls }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            repeat(5) { index ->
-                Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp).height(210.dp).background(if (index % 2 == 0) Color(0xFFE9E6E0) else Color(0xFFD9D5CF)), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(if (index % 2 == 0) "—  ${manga.emoji}  —" else "✦  ✦  ✦", color = Color.DarkGray, fontSize = 32.sp)
-                        Text("معاينة قارئ فقط", color = Color.DarkGray, fontWeight = FontWeight.Bold)
-                        Text("اربط صور الفصل المرخّص لعرض الصفحات الفعلية", color = Color.Gray, fontSize = 10.sp)
+            if (pageUrls.isNotEmpty()) {
+                pageUrls.forEachIndexed { index, url ->
+                    coil.compose.AsyncImage(
+                        model = url,
+                        contentDescription = "صفحة ${index + 1} من الفصل $chapter",
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 1.dp),
+                    )
+                }
+            } else {
+                Box(Modifier.fillMaxWidth().padding(18.dp).height(260.dp).background(Color(0xFFE9E6E0), RoundedCornerShape(16.dp)), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(20.dp)) {
+                        Text(manga.emoji, color = Color.DarkGray, fontSize = 38.sp)
+                        Text("قارئ MangaVerse", color = Color.DarkGray, fontWeight = FontWeight.Bold)
+                        Text(pageLoadMessage, color = Color.Gray, fontSize = 12.sp)
                     }
                 }
             }
@@ -310,7 +456,7 @@ private fun ReaderScreen(manga: Manga, onBack: () -> Unit) {
             Row(Modifier.fillMaxWidth().padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = { chapter = (chapter - 1).coerceAtLeast(1) }) { Text("السابق", color = Color.White) }
                 Text("صفحة تجريبية", color = Color.LightGray, fontSize = 12.sp)
-                TextButton(onClick = { chapter++ }) { Text("التالي", color = Color.White) }
+                TextButton(onClick = { chapter = (chapter + 1).coerceAtMost(manga.chapters.coerceAtLeast(1)) }) { Text("التالي", color = Color.White) }
             }
         }
     }
@@ -335,7 +481,7 @@ private fun LibraryScreen(favorites: List<Manga>, onOpen: (Manga) -> Unit) {
 }
 
 @Composable
-private fun AccountScreen(email: String, onAuth: () -> Unit, onAdmin: () -> Unit, admin: Boolean) {
+private fun AccountScreen(email: String, onAuth: () -> Unit, onSignOut: () -> Unit, onAdmin: () -> Unit, admin: Boolean) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("حسابي", color = Ink, fontWeight = FontWeight.ExtraBold, fontSize = 25.sp)
         Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Color.White).padding(18.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -348,8 +494,15 @@ private fun AccountScreen(email: String, onAuth: () -> Unit, onAdmin: () -> Unit
         AccountRow(Icons.Default.CloudSync, "المزامنة السحابية", if (email.isBlank()) "سجّل الدخول لتفعيلها" else "تتم مزامنة بيانات حسابك")
         AccountRow(Icons.Default.Settings, "الإعدادات", "اللغة • المظهر • القارئ")
         AccountRow(Icons.Default.Notifications, "الإشعارات", "الفصول الجديدة")
-        Button(onClick = onAuth, Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(14.dp)) { Text(if (email.isBlank()) "تسجيل الدخول / إنشاء حساب" else "إدارة الحساب") }
-        OutlinedButton(onClick = onAdmin, Modifier.fillMaxWidth()) { Icon(Icons.Default.AdminPanelSettings, null); Spacer(Modifier.width(8.dp)); Text(if (admin) "إغلاق لوحة الإدارة" else "لوحة الإدارة") }
+        Button(onClick = onAuth, Modifier.fillMaxWidth().height(50.dp), shape = RoundedCornerShape(14.dp)) { Text(if (email.isBlank()) "تسجيل الدخول / إنشاء حساب" else "إضافة حساب آخر") }
+        if (email.isNotBlank()) {
+            OutlinedButton(onClick = onSignOut, Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                Icon(Icons.Default.Logout, null)
+                Spacer(Modifier.width(8.dp))
+                Text("تسجيل الخروج")
+            }
+        }
+        OutlinedButton(onClick = onAdmin, Modifier.fillMaxWidth()) { Icon(Icons.Default.AdminPanelSettings, null); Spacer(Modifier.width(8.dp)); Text(if (admin) "إغلاق نموذج الاقتراح" else "اقتراح مانجا جديدة") }
         Text("لوحة الإدارة هنا نموذج أولي؛ صلاحيات الإدارة الحقيقية يجب أن يفرضها الخادم.", color = Muted, fontSize = 11.sp)
     }
 }
@@ -372,13 +525,32 @@ private fun AuthScreen(onBack: () -> Unit, onSignedIn: (String) -> Unit) {
         IconButton(onClick = onBack) { Icon(Icons.Default.ArrowForward, null) }
         Text(if (creating) "إنشاء حساب" else "أهلاً بعودتك", color = Ink, fontWeight = FontWeight.Black, fontSize = 28.sp)
         Text("سجّل الدخول حتى تبقى مكتبتك معك على كل أجهزتك.", color = Muted)
-        OutlinedTextField(email, { email = it }, Modifier.fillMaxWidth(), label = { Text("البريد الإلكتروني") }, singleLine = true)
-        OutlinedTextField(password, { password = it }, Modifier.fillMaxWidth(), label = { Text("كلمة المرور") }, singleLine = true)
+        OutlinedTextField(
+            value = email,
+            onValueChange = { email = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("البريد الإلكتروني") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+            singleLine = true
+        )
+        OutlinedTextField(
+            value = password,
+            onValueChange = { password = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("كلمة المرور") },
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            singleLine = true
+        )
         if (message.isNotBlank()) Text(message, color = Color(0xFFB3261E), fontSize = 12.sp)
         Button(onClick = {
             if (email.isBlank() || password.length < 6) { message = "أدخل بريدًا صحيحًا وكلمة مرور من 6 أحرف على الأقل."; return@Button }
             busy = true; message = ""
-            val auth = FirebaseAuth.getInstance()
+            val auth = try { FirebaseAuth.getInstance() } catch (_: IllegalStateException) {
+                busy = false
+                message = "Firebase غير مربوط بعد. أضف google-services.json إلى مجلد app ثم أعد تشغيل التطبيق."
+                return@Button
+            }
             val task = if (creating) auth.createUserWithEmailAndPassword(email.trim(), password) else auth.signInWithEmailAndPassword(email.trim(), password)
             task.addOnCompleteListener { result ->
                 busy = false
@@ -404,29 +576,47 @@ private fun AdminPanel(onClose: () -> Unit) {
     var busy by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize().background(Color.White).verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text("لوحة إدارة المحتوى", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+            Text("اقتراح مانجا جديدة", color = Ink, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
             IconButton(onClick = onClose) { Icon(Icons.Default.Close, null) }
         }
-        Text("إضافة بيانات مانجا إلى Firestore. رفع صور الصفحات يحتاج اختيار ملفات وربط Storage.", color = Muted, fontSize = 12.sp)
+        Text("أرسل اسم المانجا للمراجعة. النشر الفعلي وإضافة الفصول يبقيان بيد المشرف المصرّح له.", color = Muted, fontSize = 12.sp)
         OutlinedTextField(title, { title = it }, Modifier.fillMaxWidth(), label = { Text("اسم المانجا") })
         OutlinedTextField(chapter, { chapter = it }, Modifier.fillMaxWidth(), label = { Text("رقم الفصل") })
         Button(onClick = {
-            val user = FirebaseAuth.getInstance().currentUser
+            val user = try { FirebaseAuth.getInstance().currentUser } catch (_: IllegalStateException) {
+                status = "Firebase غير مربوط. أضف google-services.json أولاً."; return@Button
+            }
             if (user == null) { status = "يجب تسجيل الدخول أولاً."; return@Button }
             if (title.isBlank()) { status = "اكتب اسم المانجا."; return@Button }
             busy = true
-            FirebaseFirestore.getInstance().collection("manga")
+            FirebaseFirestore.getInstance().collection("mangaSubmissions")
                 .add(mapOf("title" to title.trim(), "latestChapter" to chapter.toIntOrNull(), "status" to "pending_review", "createdBy" to user.uid, "createdAt" to System.currentTimeMillis()))
-                .addOnSuccessListener { status = "تم حفظ سجل المانجا للمراجعة."; title = ""; busy = false }
+                .addOnSuccessListener { status = "تم إرسال اقتراحك للمراجعة."; title = ""; busy = false }
                 .addOnFailureListener { status = "فشل الحفظ: ${it.localizedMessage}"; busy = false }
         }, Modifier.fillMaxWidth(), enabled = !busy) { Text(if (busy) "جارٍ الحفظ..." else "حفظ للمراجعة") }
         if (status.isNotBlank()) Text(status, color = Violet)
-        Text("مهم: لا تمنح صلاحيات الإدارة اعتمادًا على إظهار هذه الشاشة فقط. طبّق custom claims وقواعد Firebase.", color = Color(0xFF9B3A31), fontSize = 12.sp)
+        Text("هذا النموذج لا يمنح صلاحيات نشر. يجب أن تقيّد قواعد Firebase النشر للمشرفين فقط.", color = Color(0xFF9B3A31), fontSize = 12.sp)
     }
 }
 
+private fun currentFirebaseUserEmail(): String = try {
+    FirebaseAuth.getInstance().currentUser?.email.orEmpty()
+} catch (_: IllegalStateException) { "" }
+
+private fun syncReadingProgress(mangaId: String, chapter: Int) {
+    val user = try { FirebaseAuth.getInstance().currentUser } catch (_: IllegalStateException) { null } ?: return
+    FirebaseFirestore.getInstance()
+        .collection("users").document(user.uid)
+        .collection("readingProgress").document(mangaId)
+        .set(mapOf(
+            "mangaId" to mangaId,
+            "chapter" to chapter,
+            "updatedAt" to System.currentTimeMillis()
+        ), com.google.firebase.firestore.SetOptions.merge())
+}
+
 private fun syncFavorite(mangaId: String, favorite: Boolean) {
-    val user = FirebaseAuth.getInstance().currentUser ?: return
+    val user = try { FirebaseAuth.getInstance().currentUser } catch (_: IllegalStateException) { null } ?: return
     val ref = FirebaseFirestore.getInstance().collection("users").document(user.uid).collection("favorites").document(mangaId)
     if (favorite) ref.set(mapOf("mangaId" to mangaId, "updatedAt" to System.currentTimeMillis()))
     else ref.delete()
