@@ -15,8 +15,10 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.ProgressBar
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -25,6 +27,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
@@ -94,7 +99,7 @@ class MainActivity : Activity() {
             text = "فيرا"; textSize = 22f; setTextColor(INK); typeface = Typeface.DEFAULT_BOLD
         })
         status = TextView(this).apply {
-            text = "اختر ملف النموذج (GGUF) حتى نبدأ"; textSize = 12f; setTextColor(MUTED)
+            text = "اضغط «النماذج» وحمّل نموذج حتى نبدأ"; textSize = 12f; setTextColor(MUTED)
         }
         header.addView(status)
 
@@ -110,7 +115,7 @@ class MainActivity : Activity() {
         }
         val lp = { LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)).apply { marginEnd = dp(6) } }
         bar.addView(modeSpinner, LinearLayout.LayoutParams(0, dp(44), 1f))
-        bar.addView(btn("النموذج") { pickModel() }, lp())
+        bar.addView(btn("النماذج") { models() }, lp())
         bar.addView(btn("جديدة") { newChat() }, lp())
         bar.addView(btn("إعدادات") { settings() }, lp())
         header.addView(bar)
@@ -150,14 +155,14 @@ class MainActivity : Activity() {
         setContentView(root)
 
         // تحميل آخر نموذج تلقائياً
-        prefs.getString("uri", null)?.let { loadModel(Uri.parse(it)) }
+        prefs.getString("last", null)?.let { if (it.startsWith("content:")) loadUri(Uri.parse(it)) else if (File(it).exists()) loadPath(it) }
     }
 
     private var emptyView: View? = null
 
     private fun showEmpty() {
         emptyView = TextView(this).apply {
-            text = "حمّل ملف فيرا (GGUF) من زر «النموذج»، وبعدها اكتب أي شي."
+            text = "اضغط «النماذج» فوق، حمّل نموذج، وبعدها اكتب أي شي."
             setTextColor(MUTED); gravity = Gravity.CENTER; textSize = 14f
             setPadding(dp(20), dp(60), dp(20), 0)
         }
@@ -170,7 +175,74 @@ class MainActivity : Activity() {
     }
 
     // ---------------- النموذج ----------------
-    private fun pickModel() {
+    private class Entry(val title: String, val url: String, val gb: Double, val ram: String) {
+        val file: String get() = url.substringAfterLast('/').substringBefore('?')
+    }
+
+    // نماذج Qwen3 الأصلية للتجربة (نفس القواعد اللي تتدرب عليها فيرا)
+    private val catalog = listOf(
+        Entry("مستوى 1 • Qwen3 0.6B", "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_S.gguf", 0.4, "1 GB"),
+        Entry("مستوى 2 • Qwen3 1.7B", "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf", 1.1, "2 GB"),
+        Entry("مستوى 3 • Qwen3 4B (Q3)", "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q3_K_M.gguf", 2.1, "3 GB"),
+        Entry("مستوى 4 • Qwen3 4B (Q5)", "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q5_K_M.gguf", 2.9, "4 GB"),
+        Entry("مستوى 5 • Qwen3 8B (Q3)", "https://huggingface.co/unsloth/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q3_K_M.gguf", 4.1, "5 GB"),
+        Entry("مستوى 6 • Qwen3 8B (Q4)", "https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf", 5.0, "6 GB")
+    )
+
+    private fun modelsDir(): File = (getExternalFilesDir("models") ?: File(filesDir, "models")).also { it.mkdirs() }
+
+    private fun dialog() = AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+
+    private fun models() {
+        if (busy) return
+        val dir = modelsDir()
+        val labels = mutableListOf<String>()
+        val actions = mutableListOf<() -> Unit>()
+        for (e in catalog) {
+            val f = File(dir, e.file)
+            val have = f.exists()
+            labels.add((if (have) "✓ " else "⬇ ") + e.title + "  •  " + "%.1f".format(e.gb) + " GB  •  رام " + e.ram)
+            actions.add { if (have) haveDialog(f) else download(e.url, e.file) }
+        }
+        dir.listFiles { x -> x.name.endsWith(".gguf") && catalog.none { it.file == x.name } }?.forEach { f ->
+            labels.add("✓ " + f.name + "  •  " + "%.1f".format(f.length() / 1e9) + " GB")
+            actions.add { haveDialog(f) }
+        }
+        labels.add("🔗 رابط مخصص (مثلاً فيرا اللي دربتها)"); actions.add { customUrl() }
+        labels.add("📁 اختيار ملف من الجوال"); actions.add { pickFile() }
+        dialog().setTitle("النماذج (Qwen3 الأصلية للتجربة)")
+            .setItems(labels.toTypedArray()) { _, i -> actions[i]() }.show()
+    }
+
+    private fun haveDialog(f: File) {
+        dialog().setTitle(f.name)
+            .setPositiveButton("تشغيل") { _, _ -> loadPath(f.absolutePath) }
+            .setNegativeButton("حذف") { _, _ ->
+                if (prefs.getString("last", "") == f.absolutePath) { Native.unload(); loaded = false }
+                f.delete(); status.text = "انحذف النموذج"
+            }
+            .setNeutralButton("الغاء", null).show()
+    }
+
+    private fun customUrl() {
+        val et = EditText(this).apply {
+            hint = "https://huggingface.co/.../resolve/main/vera.gguf"
+            setTextColor(INK); setHintTextColor(MUTED); textDirection = View.TEXT_DIRECTION_LTR
+            inputType = InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val box = LinearLayout(this).apply { setPadding(dp(20), dp(8), dp(20), 0); addView(et, LinearLayout.LayoutParams(-1, -2)) }
+        dialog().setTitle("رابط ملف GGUF").setView(box)
+            .setPositiveButton("تحميل") { _, _ ->
+                val url = et.text.toString().trim()
+                if (url.startsWith("http")) {
+                    var name = url.substringAfterLast('/').substringBefore('?')
+                    if (!name.endsWith(".gguf")) name += ".gguf"
+                    download(url, name)
+                }
+            }.setNegativeButton("الغاء", null).show()
+    }
+
+    private fun pickFile() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
@@ -183,47 +255,116 @@ class MainActivity : Activity() {
         super.onActivityResult(req, res, data)
         if (req == 1 && res == RESULT_OK && data?.data != null) {
             val uri = data.data!!
-            try {
-                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (_: Exception) {}
-            prefs.edit().putString("uri", uri.toString()).apply()
-            loadModel(uri)
+            try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            loadUri(uri)
         }
     }
 
-    private fun loadModel(uri: Uri) {
+    private fun ramInfo(sizeGb: Double): String {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        var s = "%.1f GB، الرام المتاح %.1f GB".format(sizeGb, mi.availMem / 1e9)
+        if (sizeGb * 1e9 > mi.availMem * 0.9) s += " (الرام قليلة، قد يتوقف)"
+        return s
+    }
+
+    private fun loadDone(err: String, info: String) {
+        if (err.isEmpty()) { loaded = true; status.text = "جاهز • $info" }
+        else status.text = "فشل تحميل النموذج. تأكد انه ملف GGUF سليم ومكتمل."
+    }
+
+    private fun loadPath(path: String) {
         if (busy) return
-        loaded = false
-        status.text = "جاري تحميل النموذج…"
+        prefs.edit().putString("last", path).apply()
+        loaded = false; status.text = "جاري تحميل النموذج…"
         thread {
-            var err = ""
-            var info = ""
+            val gb = File(path).length() / 1e9
+            val err = try { Native.unload(); Native.load(path) } catch (e: Exception) { "ERR_EX" }
+            runOnUiThread { loadDone(err, ramInfo(gb)) }
+        }
+    }
+
+    private fun loadUri(uri: Uri) {
+        if (busy) return
+        prefs.edit().putString("last", uri.toString()).apply()
+        loaded = false; status.text = "جاري تحميل النموذج…"
+        thread {
+            var err = ""; var gb = 0.0
             try {
                 pfd?.close(); Native.unload()
                 val p = contentResolver.openFileDescriptor(uri, "r")!!
-                pfd = p
-                val sizeGb = p.statSize / 1e9
-                val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                val mi = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
-                info = "%.1f GB، الرام المتاح %.1f GB".format(sizeGb, mi.availMem / 1e9)
-                if (sizeGb * 1e9 > mi.availMem * 0.9) info += " (الرام قليلة، قد يتوقف)"
-
+                pfd = p; gb = p.statSize / 1e9
                 err = Native.load("/proc/self/fd/${p.fd}")
                 if (err.isNotEmpty()) {
-                    // خطة بديلة: ننسخ الملف لمساحة التطبيق
-                    runOnUiThread { status.text = "ننسخ النموذج لمساحة التطبيق… ($info)" }
+                    runOnUiThread { status.text = "ننسخ النموذج لمساحة التطبيق…" }
                     val dst = File(filesDir, "model.gguf")
-                    contentResolver.openInputStream(uri)!!.use { ins ->
-                        dst.outputStream().use { ins.copyTo(it, 1 shl 20) }
-                    }
+                    contentResolver.openInputStream(uri)!!.use { ins -> dst.outputStream().use { ins.copyTo(it, 1 shl 20) } }
                     err = Native.load(dst.absolutePath)
                 }
-            } catch (e: Exception) {
-                err = "ERR_EX"
-            }
+            } catch (e: Exception) { err = "ERR_EX" }
+            runOnUiThread { loadDone(err, ramInfo(gb)) }
+        }
+    }
+
+    // ---------------- التحميل داخل التطبيق ----------------
+    private fun download(url: String, name: String) {
+        val dir = modelsDir()
+        val dst = File(dir, name); val part = File(dir, "$name.part")
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000 }
+        val txt = TextView(this).apply { setTextColor(INK); text = "جاري الاتصال…" }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(8))
+            addView(txt); addView(bar)
+        }
+        val cancel = java.util.concurrent.atomic.AtomicBoolean(false)
+        val dlg = dialog().setTitle("تحميل $name").setView(box).setCancelable(false)
+            .setNegativeButton("الغاء") { _, _ -> cancel.set(true) }.create()
+        dlg.show()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        thread {
+            var err = ""
+            try {
+                val have = if (part.exists()) part.length() else 0L
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.connectTimeout = 20000; conn.readTimeout = 30000
+                conn.setRequestProperty("User-Agent", "VeraApp/1.0")
+                if (have > 0) conn.setRequestProperty("Range", "bytes=$have-")
+                val code = conn.responseCode
+                if (code != 200 && code != 206) throw RuntimeException("HTTP $code")
+                val append = code == 206
+                val startAt = if (append) have else 0L
+                val total = startAt + conn.contentLengthLong
+                conn.inputStream.use { ins ->
+                    FileOutputStream(part, append).use { out ->
+                        val buf = ByteArray(256 * 1024)
+                        var done = startAt; var last = 0L
+                        while (true) {
+                            if (cancel.get()) throw InterruptedException()
+                            val n = ins.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); done += n
+                            val now = System.currentTimeMillis()
+                            if (now - last > 300) {
+                                last = now
+                                val d = done; val t = maxOf(total, done)
+                                runOnUiThread {
+                                    bar.progress = (d * 1000 / t).toInt()
+                                    txt.text = "%.2f / %.2f GB".format(d / 1e9, t / 1e9)
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!part.renameTo(dst)) throw RuntimeException("rename")
+            } catch (e: InterruptedException) { err = "cancel" }
+            catch (e: Exception) { err = e.message ?: "error" }
             runOnUiThread {
-                if (err.isEmpty()) { loaded = true; status.text = "جاهز، النموذج: $info" }
-                else status.text = "فشل تحميل النموذج. تأكد انه ملف GGUF سليم."
+                dlg.dismiss(); window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                when (err) {
+                    "" -> loadPath(dst.absolutePath)
+                    "cancel" -> status.text = "انلغى التحميل (يكمل من نفس المكان اذا حملت ثانية)"
+                    else -> status.text = "فشل التحميل: $err. تأكد من الإنترنت او استعمل رابط مخصص."
+                }
             }
         }
     }
